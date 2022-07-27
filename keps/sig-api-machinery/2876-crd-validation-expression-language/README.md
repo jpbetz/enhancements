@@ -608,8 +608,8 @@ Any function library change must follow the [API Changes](https://github.com/kub
 guidelines. Since a change to the function library is a change to the `x-kubernetes-validations.rule` field, it must be
 introduced one Kubernetes release prior to when it may be included in create/update requests to CRDs. Specifically:
 
-- Kubernetes Version N-1: Entirely unaware of the library update.
-- Kubernetes Version N: Supports CRD that use library updates, but does not allow the library updates to used when
+- Kubernetes Version N-2: Entirely unaware of the library update.
+- Kubernetes Version N-1, N: Supports CRD that use library updates, but does not allow the library updates to used when
   setting `x-kubernetes-validations.rule` fields.
 - Kubernetes Version N+1: Library update fully enabled.
 
