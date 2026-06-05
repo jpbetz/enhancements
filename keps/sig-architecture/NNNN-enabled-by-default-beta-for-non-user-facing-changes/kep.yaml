@@ -1,0 +1,39 @@
+title: Enabled-by-Default Beta for Non-User-Facing Changes
+kep-number: NNNN
+authors:
+  - "@jpbetz"
+owning-sig: sig-architecture
+participating-sigs:
+  - sig-api-machinery
+  - sig-etcd
+status: provisional
+creation-date: 2026-06-02
+reviewers:
+  - "@deads2k"
+  - "@liggitt"
+  - "@wojtek-t"
+approvers:
+  - "@johnbelamaric"
+  - "@derekwaynecarr"
+  - "@dims"
+
+see-also:
+  - "/keps/sig-architecture/5241-beta-featuregate-promotion-requirements"
+  - "/keps/sig-architecture/1194-prod-readiness"
+  - "/keps/sig-architecture/3136-beta-apis-off-by-default"
+replaces:
+
+# This is a process/position KEP. Like KEP-5241, it carries no feature gate of
+# its own; the fields below are intentionally empty.
+stage: stable
+
+# TODO(jpbetz): set to the release in which this position statement is approved.
+latest-milestone: "v1.37"
+
+milestone:
+  stable: "v1.37"
+
+feature-gates:
+disable-supported: false
+
+metrics:
