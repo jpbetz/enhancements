@@ -1,8 +1,17 @@
 # KEP-5975: Feature-Gate Field Dropping — Design Note
 
-Working design note for the "Feature-Gate Field Dropping" section of KEP-5975.
-Status: proposal for discussion. All file:line references are against
-kubernetes/kubernetes at the time of writing.
+Design note for the "Feature-Gate Field Dropping" section of KEP-5975.
+
+**Status: implemented** as a 5-commit stack on branch `kep5975-featuregate-tag`
+(`21d9812f096 .. 758dcc9a8fc`, base `808a553dc88`). The chosen architecture is
+**Model C2 — full versioned processing**: a `+k8s:featureGate(drop: true)` tag on
+**versioned** types drives a generated drop that is registered into a
+`runtime.Scheme` and run in the apiserver write path by converting the internal
+object to the request version, dropping, and converting back. Coverage is the
+`output_tests/drops` generator fixture plus scheme/write-path unit tests (§5); no
+shipped resource has been migrated yet. All file:line references are against that
+branch. (See §8 for the design history — the model went through two reversals
+before landing here.)
 
 ## 1. Problem
 
@@ -31,466 +40,531 @@ escape hatch for the rest, and make non-conformance detectable.
 1. **The "in-use" predicate is the same path-walk as the drop**, read instead
    of cleared ("is this field set anywhere in `old`"). That is what makes
    generation feasible — both the clear and the in-use helper derive from the
-   field's location in the type graph.
+   field's location in the type graph. The generator emits both from one tag:
+   `dropDisabled_<Gate>_<Type>` (clear) and `inUse_<Gate>_<Type>` (read).
 
 2. **validation-gen emits one function per type and delegates** — it does *not*
    produce flat root-rooted paths. `Validate_DeviceClaim` calls
    `EachSliceVal(..., Validate_DeviceRequest)`
    (`pkg/apis/resource/v1/zz_generated.validations.go`). The type graph is a
-   memoized per-type DAG (`validation.go:321`, path rebooted per named type at
-   `:338`). So a drop emitter must mirror the **per-type delegating** structure
-   and is **cycle-safe by construction**; a flat emitter would infinite-loop on
-   recursive types.
+   memoized per-type DAG. The drop emitter **reuses this exact shared
+   `typeDiscoverer` graph** (`discovered.typeNodes`; see `drops.go`
+   `gatesForNode`/`gatesViaFields` and `targets.go`, where discovery "builds the
+   type-graph that BOTH genValidations and genDrops consume"). So drop emission
+   mirrors the per-type delegating structure and is **cycle-safe by
+   construction**; it does not re-walk types or re-parse comments.
 
-3. **Declarative validation runs on the *versioned* object** — `validateDeclaratively`
-   converts internal→versioned and validates a throwaway copy
-   (`staging/src/k8s.io/apiserver/pkg/registry/rest/validate.go:140`). Validation
-   only reads, so the copy is fine. **Dropping mutates the persisted object** and
-   runs on **internal** types in the strategy
-   (`pkg/api/resourceclaimspec/util.go:33` takes `*resource.ResourceClaimSpec`).
-   A convert→drop→convert-back round-trip on every write would be costly and
-   conversion-lossy. This internal/versioned split is the central seam.
+3. **Dropping runs on the *versioned* object, via an explicit in-write-path
+   conversion.** Declarative validation already converts internal→versioned and
+   validates a throwaway copy (`validateDeclaratively`, `rest/validate.go`).
+   Dropping does the same but **mutates and writes back**: `DropDeclaratively`
+   (`rest/validate.go:98`) converts internal→request-version
+   (`Scheme.ConvertToVersion`), runs `Scheme.Drop` (mutates in place), then
+   converts the dropped object **back** to internal
+   (`Scheme.Convert(versionedObj, obj, nil)`, `rest/validate.go:137`). The cost
+   of the round-trip is addressed by a cheap pre-check — `Scheme.HasDropFunc(gvk)`
+   (`scheme.go:442`) short-circuits before any conversion for resources with no
+   registered drop, so declarative-validation resources without drops pay zero
+   added cost. The *remaining* tradeoff is **fidelity**, not cost: the
+   convert-back can be lossy (see §4.3). (The earlier internal-typed model that
+   avoided conversion was abandoned — §8.) `pkg/api/resourceclaimspec/` is
+   **untouched** upstream code; there is no generated drop there.
 
 4. **A `+k8s:featureGate` tag must NOT auto-imply a drop.** HPA adds the
    `HPAScaleToZero` DV option that *allows* `MinReplicas==0`
-   (`pkg/registry/autoscaling/horizontalpodautoscaler/strategy.go:89-104`) but
-   **never drops `MinReplicas`** — it drops only `Tolerance` (a different gate).
+   (`pkg/registry/autoscaling/horizontalpodautoscaler/strategy.go`) but **never
+   drops `MinReplicas`** — it drops only `Tolerance` (a different gate).
    Auto-dropping every gated field would silently wipe a user's `minReplicas: 0`.
-   Drop must be an explicit opt-in.
+   Drop is an explicit opt-in: a bare `+k8s:featureGate=<Gate>` records no
+   `DropSpec`; only `+k8s:featureGate(drop: true)=<Gate>` opts in.
 
-5. **Drop happens before validation**: `PrepareForCreate`→`Validate`→
-   `ValidateDeclaratively` (`rest/create.go`), so validation sees the post-drop
-   object. Generated drops call `utilfeature.DefaultFeatureGate.Enabled(...)`
-   directly — `Prepare*` carries no `Options` (those are built later, in
-   `DeclarativeValidationConfig`).
+5. **Drop happens after `Prepare*` and before validation.** It is invoked in
+   `rest.BeforeCreate` (`create.go:133`) / `rest.BeforeUpdate` (`update.go:139`),
+   *after* `PrepareForCreate`/`PrepareForUpdate` and *before* `strategy.Validate`
+   /`ValidateUpdate`/`ValidateDeclaratively`, so validation sees the post-drop
+   object. It runs via a `DeclarativeMutationStrategy` type-assertion
+   (`validate.go:86`) and is **unconditional** — independent of the
+   `DeclarativeValidation`/`DeclarativeValidationBeta` feature gates (dropping is
+   correctness/security, not an opt-in validation behavior). The generated code
+   itself reads `DefaultFeatureGate.Enabled(features.<Gate>)` (from
+   `k8s.io/apiserver/pkg/util/feature`). On update the drop runs before the
+   UID/timestamp metadata fix-ups.
 
-6. **The proposed framework does not exist yet**: `registry.NewREST`,
-   `registry.RESTConfig`, `strategy.Config[T]`, the `DropDisabledFields` hook,
-   and `SpecAccessor`/`StatusAccessor` are KEP-only (grep finds them only in the
-   doc). The `+k8s:featureGate` *validation* tag exists only on the
-   `origin/default-option-poc` branch (validation-only, `ScopeField`-only,
-   rejects non-pointer structs); mainline `Conditions` is single-valued.
+6. **The framework exists** (this branch), and it is *not* the one the early KEP
+   draft proposed. There is **no** `registry.NewREST`, `registry.RESTConfig`,
+   `strategy.Config[T]`, `SpecAccessor`/`StatusAccessor`, or a
+   `DropDisabledFields` strategy hook. Instead:
+   - `runtime.Scheme` gains drop dispatch (`AddDropFunc`/`AddDropOptionsFunc`/
+     `Drop`/`HasDropFunc`/`DropOptions`, `scheme.go:407-455`).
+   - Generated `RegisterDrops` registers per-root drop + options closures into a
+     `Scheme` via `localSchemeBuilder`.
+   - The apiserver adds the `DeclarativeMutationStrategy` interface +
+     `DropDeclaratively` (`validate.go:86-140`), satisfied by embedding
+     `rest.DeclarativeValidation`.
+   The `+k8s:featureGate` tag is landed with **multi-valued** `Conditions`
+   (`OptionsEnabled`/`OptionsDisabled []string` + `Inverted bool`), not the
+   single-valued POC form.
 
 7. **`+featureGate=<Gate>` docs comments already exist** (no `k8s:` prefix; 86
    on internal types, 334 on versioned) but are **incomplete** vs actual drop
-   logic (Pod drops touch ~35 gates; ~10 of the fields are marked) and are not
-   machine-parsed. They are a starting inventory, not the source of truth.
+   logic and are not machine-parsed. They are a starting inventory, not the
+   source of truth, and are unrelated to the new tag.
 
-## 3. Realistic coverage
+## 3. Realistic coverage (background; nothing shipped is migrated yet)
 
-Well under the "80%" first guess. Mechanically generatable:
+The realistic mechanically-generatable surface is well under an "80%" first
+guess. This analysis motivated the escape-hatch design; it is **decoupled from
+what shipped** — the implementation proves the mechanism on synthetic types and
+migrates no real resource.
+
+Mechanically generatable:
 
 - **Presence-gated single leaf** on pointer/slice/map (in-use = `!=nil` /
   `len>0`): PVC/PV `VolumeAttributesClassName`, deviceclass
-  `ExtendedResourceName`, workload `SchedulingConstraints`/`PriorityClassName`,
-  most DRA spec leaves.
+  `ExtendedResourceName`, most DRA spec leaves.
 - **Nested presence leaves** reached by descending slices/maps/structs, incl.
   the same gate on a field appearing in multiple sub-types (DRA `Tolerations` in
-  both `ExactDeviceRequest` and `DeviceSubRequest`) via **multi-leaf OR-reduced**
-  in-use.
+  both `ExactDeviceRequest` and `DeviceSubRequest`) via a **multi-leaf
+  OR-reduced** in-use.
 
-Escape-hatch by construction (verified examples):
+What the generator concretely supports today (`drops.go`):
+
+- **Drop leaves**: pointer / slice / map (cleared to `nil`) and builtin scalars
+  (cleared to the zero literal `false`/`""`/`0`).
+- **Recursion**: struct, pointer-to-struct, slice-of-(struct | pointer-struct).
+- **Loud failures** (`klog.Fatalf`, never silently skipped): value-typed struct
+  leaves; map-of-struct recursion; unresolvable slice element type.
+
+Escape-hatch by construction (verified hand-written examples that are *not*
+generatable today):
 
 - **Value-conditioned in-use**: ProcMount in-use is `*ProcMount != DefaultProcMount`,
-  not `!=nil`, and it **resets to `&DefaultProcMount`**, not `nil`
-  (`util.go:1198,1430`); HPA `*MinReplicas==0`; containerRestartRules keeps
-  InitContainer `RestartPolicy==Always`.
+  and it **resets to `&DefaultProcMount`**, not `nil`; HPA `*MinReplicas==0`;
+  containerRestartRules keeps InitContainer `RestartPolicy==Always`.
 - **Compound new-object precondition**: PVC `dataSourceRef` drops only if
-  `DataSourceRef!=nil && Namespace!=nil && len(*Namespace)!=0 && !inUse(old)`
-  — reads a sibling subfield on **new** (`persistentvolumeclaim/util.go:48`).
+  `DataSourceRef!=nil && Namespace!=nil && len(*Namespace)!=0 && !inUse(old)`.
 - **Clear-leaf-then-collapse-empty-parent**: `dropContainerStopSignals` nils the
-  whole `Lifecycle` once empty (`util.go:828`); same for sleep action.
+  whole `Lifecycle` once empty.
 - **List-element removal with reference fixups**: `dropImageVolumes` rebuilds
-  `Volumes` and patches every `VolumeMount` by name (`util.go:1608`).
+  `Volumes` and patches every `VolumeMount` by name.
 - **Set-membership compaction that must run last**: `dropDeallocatedStatusDevices`
-  (`resourceclaim/strategy.go:200`, "NOP if fields got dropped, so do this last").
+  ("NOP if fields got dropped, so do this last").
 - **Pod container-nested fields generally**: `EphemeralContainer` embeds
-  `EphemeralContainerCommon`, a *distinct* type from `Container` bridged by
-  unsafe cast; the type-graph walker has no notion of the init/main/ephemeral
-  tri-slice that `VisitContainers` traverses uniformly. Escape-hatch in Phase 1.
+  `EphemeralContainerCommon`, a *distinct* type bridged by unsafe cast; the
+  type-graph walker has no notion of the init/main/ephemeral tri-slice.
 
-## 4. Design
+## 4. Design (Model C2)
 
 ### 4.1 Tag
 
-Two-part marker on **versioned** types (where validation-gen reads tags):
+A single marker on **versioned** types (where validation-gen reads tags):
 
-- `+k8s:featureGate=<Gate>` — DV gating; `ScopeField`; repeatable (ANDed).
-- `(drop)` attribute — **mandatory opt-in** to dropping. Bare
-  `+k8s:featureGate` is DV-only and is *never* dropped (the HPA-safe default).
+- `+k8s:featureGate=<Gate>` — declarative-validation gating. The gate name is the
+  required string payload. Scope is **field only**; the validator rejects
+  non-pointer structs (`featuregate.go`). Stability: alpha. Repeatable → gates
+  are **ANDed**: the field is forbidden when *any* required gate is disabled
+  (emitted as one `!(op.HasOption("A") && op.HasOption("B"))` via the
+  multi-valued `Conditions{OptionsEnabled: gates, Inverted: true}`).
+- `(drop: true)` named-bool arg — **mandatory opt-in** to dropping. A bare
+  `+k8s:featureGate` is DV-only and is *never* dropped (the HPA-safe default,
+  §2 fact 4). The only drop metadata recorded is `DropSpec{Gates []string}`.
 
 ```go
 // DV + auto drop (presence in-use):
-//   +k8s:featureGate=VolumeAttributesClass(drop)
+//   +k8s:featureGate(drop: true)=VolumeAttributesClass
 //   +k8s:optional
 VolumeAttributesClassName *string `json:"volumeAttributesClassName,omitempty"`
 
 // DV gated, intentionally NOT dropped (reject-at-validation policy):
 //   +k8s:featureGate=HPAScaleToZero
 MinReplicas *int32 `json:"minReplicas,omitempty"`
-
-// Drop body generated, in-use hand-written:
-//   +k8s:featureGate=DRAAdminAccess(drop, inUse: "custom")
-AdminAccess *bool `json:"adminAccess,omitempty"`
 ```
 
-Multi-gate semantics: field available only when **all** gates enabled → drop
-when **any** disabled AND not in-use.
+Multi-gate drop: the field is available only when **all** gates are enabled →
+drop when **any** gate is disabled AND the field is not in-use in `old`.
 
-### 4.2 Generator
+> There is no custom-in-use tag arg. An earlier draft proposed
+> `(drop, inUse: "custom")`; it was not implemented (§4.6).
 
-A **new emitter inside validation-gen** that reuses the type *graph*
-(`typeDiscoverer`/`typeNode`/`childNode`) but emits **mutation** code:
+### 4.2 Generator (`genDrops`)
 
-- Annotate `childNode` (`validation.go:213`) with `featureGates []string` +
-  `dropSpec` during struct discovery; the emitter consumes the graph without
-  re-parsing.
-- **Per-type delegating functions**: `dropDisabled_<Type>(obj *<Type>, drop bool)`
-  descends one level and delegates to element/sub-type drop fns via new
-  `DropEachSliceVal`/`DropEachMapVal` mutation helpers (siblings of
-  `EachSliceVal`). At a gated leaf, emit the clear.
-- **Whole-object in-use hoisted to the root**: a per-type fn can't see the whole
-  object, so a root `dropDisabledFields_<RootSpecType>(new, old)` computes, per
-  gate, `drop := !allEnabled(G) && !inUse_G_<Root>(old)` and threads the bool
-  down.
-- **Multi-leaf in-use aggregation**: for gate `G`, collect *all* `(drop)` leaves
-  transitively reachable carrying `G` and emit one `inUse_G_<Root>(old)` that
-  OR-reduces over them (a missing leaf = data-loss bug, so this is mandatory).
-- **Gate symbol resolution**: `features.<Gate>` → `types.Name{Package:
-  "k8s.io/kubernetes/pkg/features", Name: Gate}`; load `pkg/features` into the
-  gengo universe and assert the constant exists (fail loudly).
-- **Output**: `zz_generated.drops.go` per package; `--drops-output-file` flag;
-  `hack/update-codegen.sh` globs it for cleanup.
+A second generator inside validation-gen, run in the **same pass** as
+`genValidations` (no separate command/binary). It consumes the shared
+`typeDiscoverer` graph and reads each field's `childNode.fieldValidations.DropSpec`
+(`DropSpec{Gates []string}`, surfaced through the normal `Validations` plumbing
+alongside `DefaultConditions`).
 
-**Compile-safety guards** (force escape-hatch at codegen, with a clear error):
-gated leaf in a map value or slice-of-value-struct (non-addressable, won't
-compile); type reachable through both Spec and Status (ambiguous partition);
-type with a manual/non-1:1 conversion override (no field correspondence for the
-internal bridge — these exist, e.g. RC↔RS in `core/v1/conversion.go`).
+Emitted symbols, per root type with a drop-gated descendant:
 
-### 4.3 Internal/versioned bridge
+- `dropDisabled_<Gate>_<Type>(obj *<Type>)` — clears the gate's leaves in `obj`
+  and recurses into sub-types via inline range loops (one function per
+  `(gate, type)`, cycle-safe by construction).
+- `inUse_<Gate>_<Type>(obj *<Type>) bool` — OR-reduces "is any of the gate's
+  leaves set" over the same delegating walk.
+- `DropDisabledFields_<Root>(newObj, oldObj *<Root>)` — exported spec-scope
+  entry; per gate emits
+  `if !DefaultFeatureGate.Enabled(features.<Gate>) && !inUse_<Gate>_<Root>(oldObj) { dropDisabled_<Gate>_<Root>(newObj) }`.
+- `DropDisabledStatusFields_<Root>(newObj, oldObj *<Root>)` — status-scope entry
+  (emitted only when there are status-scope drops; see §4.5).
+- `DeclarativeValidationOptions_<Root>(oldObj) []string` — the DV options to
+  enable (gate-enabled OR in-use), reusing the same `inUse_*` helpers so drop and
+  validation ratcheting cannot desync (§4.5).
+- `RegisterDrops(scheme)` + `func init()` that registers it with
+  `localSchemeBuilder` (§4.3).
 
-Emit into `pkg/apis/<group>/<version>/zz_generated.drops.go` — the **main
-module** (`k8s.io/kubernetes`), which may import `pkg/features` (verified
-`core/v1/defaults.go`). Staging `k8s.io/api/*` must **not** import
-`pkg/features`/`apiserver` (layering), so drops cannot live there.
+Gate symbol resolution: `features.<Gate>` is rendered via the gengo universe
+(`types.Name{Package: <features-package>, Name: gate}`) where the package comes
+from `--features-package` (default `k8s.io/kubernetes/pkg/features`); the runtime
+check uses `DefaultFeatureGate` from `k8s.io/apiserver/pkg/util/feature`.
 
-Strategies operate on **internal** types, so the generator emits **two bodies
-from the one tag** — versioned and internal — guarded by an
-**auto-1:1-conversion check**; manual-conversion types fail closed to the escape
-hatch. (Open question 5.1: sig-api-machinery may instead prefer standing up
-validation-gen over internal `pkg/apis` packages.)
+**Per-package gate override.** Both the accessor (`DefaultFeatureGate`) and the
+gate-constant package are overridable per-package via
+`+k8s:validation-gen-feature-gates=<pkg>`; when set, the generated drops
+reference `<pkg>.DefaultFeatureGate` and `<pkg>.<Gate>` instead of the apiserver
+/ `--features-package` defaults. This exists so the generator output test
+(`output_tests/drops`, §4.4) — which lives in the `k8s.io/code-generator` module
+and therefore cannot import the real apiserver/`k8s.io/kubernetes` feature
+packages — can point the generated drops at a tiny in-package fake gate facility
+(`gates.go`: a `Feature` type, a `DefaultFeatureGate` with `Enabled(Feature)`,
+and the gate constants). Pointing the override at the fixture's own package makes
+those references emit unqualified.
 
-### 4.4 Generated code (DRA `Tolerations`, gate `DRADeviceTaints`, two leaves)
+**Spec/status partition** is by field name: a root field named `Status` is status
+scope, everything else is spec scope (`partitionRootFields`). The two scopes
+share the per-`(gate, type)` worker functions.
+
+**Empty-file suppression**: `genDrops` is attached to a package only when at
+least one root has a drop-gated field (`hasDrops()`, `drops.go`). Drop-free
+packages emit no `zz_generated.drops.go`. Output is one file per package via
+`--drops-output-file`; `hack/update-codegen.sh` passes it (and
+`--features-package`) on the single validation-gen pass and globs
+`**/zz_generated.drops.go` for cleanup.
+
+### 4.3 Runtime integration — scheme dispatch + write-path hook
+
+This replaces the abandoned internal/versioned dual-body bridge (§8). There is
+**no internal-typed drop and no generator-side conversion**; drops are emitted
+once on the versioned types (into `pkg/apis/<grp>/<ver>/zz_generated.drops.go`,
+in the main module, which may import `pkg/features`) and bridged to internal
+**at runtime**.
+
+**Scheme drop API** (`staging/src/k8s.io/apimachinery/pkg/runtime/scheme.go`),
+mirroring the existing validation funcs:
+
+- `dropFuncs` / `dropOptionsFuncs` maps keyed by `reflect.Type`.
+- `AddDropFunc(srcType, func(ctx, op, object, oldObject))` (`:407`) and
+  `AddDropOptionsFunc(srcType, func(oldObject) []string)` (`:414`).
+- `Drop(ctx, op, object, oldObject) bool` (`:425`) — dispatches by
+  `reflect.TypeOf`; **returns whether a func ran** (so the caller can skip the
+  write-back when nothing dropped).
+- `HasDropFunc(gvk) bool` (`:442`) — keyed on `reflect.PointerTo(gvkToType[gvk])`;
+  the cheap pre-check.
+- `DropOptions(object, oldObject) []string` (`:455`).
+
+**Generated registration**: `RegisterDrops` registers a per-root closure that
+switches on `op.Request.SubresourcePath()` (`"/"` → `DropDisabledFields_<Root>`,
+`"/status"` → `DropDisabledStatusFields_<Root>`) and an options closure
+returning `DeclarativeValidationOptions_<Root>`.
+
+**Write-path hook** (`staging/src/k8s.io/apiserver/pkg/registry/rest/validate.go`):
+the `DeclarativeMutationStrategy` interface (`:86`) with
+`DropDeclaratively(ctx, obj, oldObj, opType, config)` (`:98`), satisfied by
+embedding `rest.DeclarativeValidation`. Its body:
+
+1. resolve the request `GroupVersion` from `requestInfo` (+ subresource mapper);
+2. **pre-check**: `ObjectKinds(obj)` then `HasDropFunc(gv.WithKind(kind))`
+   (`:112`) — return immediately if nothing is registered (zero added cost for
+   declarative-validation resources without drops);
+3. `ConvertToVersion(obj, gv)` (and `ConvertToVersion(oldObj, gv)` on update);
+4. `Scheme.Drop(...)` (`:132`) — if it returns `false`, return without writing
+   back (avoid a pointless, possibly-lossy round-trip);
+5. otherwise `Scheme.Convert(versionedObj, obj, nil)` (`:137`) — write the
+   dropped result back into the internal object that will be persisted.
+
+The hook is invoked in `BeforeCreate` (`create.go:133`, old=nil) and
+`BeforeUpdate` (`update.go:139`) via the type-assertion, unconditionally (§2
+fact 5). This is precedented by mutating admission, which likewise converts
+internal→versioned, mutates, and writes back via `GetObjectConvertor().Convert`.
+
+**Fidelity risk (the central new tradeoff).** Validation discards the versioned
+copy, so it tolerates lossy conversion; dropping writes it back. A wholesale
+`Convert(versionedObj, obj)` can lose internal-only or newer-version-only data
+(e.g. an update whose preserved `old.Status` carries newer-version-only fields,
+or a non-round-tripping manual `Convert_`). The implemented mitigations cover
+**cost** (the `HasDropFunc` pre-check; skip write-back when `Drop` returns
+false), not lossiness. A per-resource **round-trip fidelity test** (fuzz
+internal→version→internal, assert equal outside dropped fields) should gate each
+real-resource migration; this is future work (§5).
+
+### 4.4 Generated code (the generator fixture)
+
+The shipped fixture is `output_tests/drops` (in the code-generator module). Its
+`Root` carries gated leaves at several shapes; the generated
+`zz_generated.drops.go` shows the **per-type delegation** (the root entry drives
+a per-type worker that descends into the `RootSpec` sub-type — exactly the
+genValidations structure, §2 fact 2) and references the package's **local fake
+gate facility** (`DefaultFeatureGate`, `MultiLeafGate`, …) *unqualified*, via the
+`+k8s:validation-gen-feature-gates` override (§4.2) — with no apiserver /
+k8s.io/kubernetes imports:
 
 ```go
-func dropDisabledFields_ResourceClaimSpec(new, old *resourcev1.ResourceClaimSpec) {
-    if new == nil { return }
-    dropDeviceTaints := !utilfeature.DefaultFeatureGate.Enabled(features.DRADeviceTaints) &&
-        !inUse_DRADeviceTaints_ResourceClaimSpec(old)
-    dropDisabled_DeviceClaim(&new.Devices, dropDeviceTaints)
-}
-
-func dropDisabled_DeviceRequest(obj *resourcev1.DeviceRequest, dropDeviceTaints bool) {
-    if obj == nil { return }
-    if obj.Exactly != nil { dropDisabled_ExactDeviceRequest(obj.Exactly, dropDeviceTaints) }
-    for i := range obj.FirstAvailable { dropDisabled_DeviceSubRequest(&obj.FirstAvailable[i], dropDeviceTaints) }
-}
-
-func dropDisabled_ExactDeviceRequest(obj *resourcev1.ExactDeviceRequest, dropDeviceTaints bool) {
-    if obj == nil { return }
-    if dropDeviceTaints { obj.Tolerations = nil }
-}
-
-// multi-leaf OR-reduced in-use over the same delegating walk
-func inUse_DRADeviceTaints_ResourceClaimSpec(old *resourcev1.ResourceClaimSpec) bool {
-    if old == nil { return false }
-    for i := range old.Devices.Requests {
-        r := &old.Devices.Requests[i]
-        if r.Exactly != nil && len(r.Exactly.Tolerations) > 0 { return true }
-        for j := range r.FirstAvailable {
-            if len(r.FirstAvailable[j].Tolerations) > 0 { return true }
-        }
+func DropDisabledFields_Root(newObj, oldObj *Root) {
+    if newObj == nil { return }
+    if !DefaultFeatureGate.Enabled(MultiLeafGate) && !inUse_MultiLeafGate_Root(oldObj) {
+        dropDisabled_MultiLeafGate_Root(newObj)
     }
+    // ... one if-block per gate (PointerLeafGate, ValueLeafGate)
+}
+
+func dropDisabled_MultiLeafGate_Root(obj *Root) {
+    if obj == nil { return }
+    dropDisabled_MultiLeafGate_RootSpec(&obj.Spec) // descend into the sub-type
+}
+
+func inUse_MultiLeafGate_Root(obj *Root) bool {
+    if obj == nil { return false }
+    if inUse_MultiLeafGate_RootSpec(&obj.Spec) { return true }
     return false
+}
+
+func DeclarativeValidationOptions_Root(oldObj *Root) []string {
+    var opts []string
+    if DefaultFeatureGate.Enabled(MultiLeafGate) || inUse_MultiLeafGate_Root(oldObj) {
+        opts = append(opts, "MultiLeafGate")
+    }
+    // ... one block per gate
+    return opts
 }
 ```
 
-Create: `dropDisabledFields_ResourceClaimSpec(&new.Spec, nil)` (in-use(nil)=false).
-Update: `(&new.Spec, &old.Spec)`.
+`MultiLeafGate` reaches the same gate through two sub-types —
+`RootSpec.Requests[*].Tolerations` (slice-of-struct) and
+`RootSpec.Requests[*].Exactly.Tolerations` (pointer-to-struct) — so
+`inUse_MultiLeafGate_RootSpec` **OR-reduces** across both leaves. The fixture
+also exercises a pointer leaf, a value (string) leaf cleared to `""`, and a
+**status-scope** leaf (`DropDisabledStatusFields_Root`). For a real API the gate
+references would instead be `feature.DefaultFeatureGate` + `features.<Gate>` (the
+§4.2 defaults); the per-type workers are also what `RegisterDrops` wires into the
+scheme.
 
 ### 4.5 Semantics
 
-- **Create** (old=nil): drop every `(drop)` field whose gates aren't all
-  enabled. **Update**: drop iff (some gate disabled) AND (not in-use in **old**).
-- **Status** drops emit a separate `dropDisabledStatusFields_<Type>` that may
-  assign only under `new.Status` (codegen-enforced); status in-use may read
-  `old.Spec` and `old.Status` (use custom in-use). Split-strategy resources call
-  it in the status substrategy after `new.Spec=old.Spec`+`ResetObjectMetaForStatus`;
-  Pod-style unified entrypoints call spec+status together (incl. create).
-- **Relationship to DV in-use/ratcheting** (scoped honestly): the
-  "drop and DV share one in-use" unification holds only for **declarative +
-  `op.HasOption`** resources, where the DV option is
-  `allowed = gate || inUse(old)` and the drop is its exact complement — both must
-  consume the same exported `inUse_<Gate>_<Type>`. For **imperative** resources
-  (Pod builds `opts.Allow*` and threads them into `ValidatePodSpec`, not
-  `op.HasOption` — `util.go:478`), the contract is instead that the generated
-  `inUse_*` is **exported and reused** by hand-written `GetValidationOptions`.
-  Value-specific options (HPA `*MinReplicas==0`) can't be fed by a presence
-  helper and are escape-hatch.
+- **Create** (old=nil): drop every `(drop: true)` field whose gates aren't all
+  enabled (`inUse(nil)` = false). **Update**: drop iff (some gate disabled) AND
+  (not in-use in **old**). These match the hand-written ratcheting contract.
+- **Status scope**: status drops are a separate generated entry
+  `DropDisabledStatusFields_<Root>`, selected at **runtime** by the subresource
+  switch inside the registered drop closure on `op.Request.SubresourcePath()`
+  (`"/"` spec, `"/status"` status). There is no strategy-substrategy plumbing;
+  the partition is purely by the root field named `Status`.
+- **Relationship to DV ratcheting**: the drop-vs-validation desync is closed by
+  the generated `DeclarativeValidationOptions_<Root>(oldObj)` (gate-enabled OR
+  in-use, including status in-use), surfaced via `Scheme.DropOptions`. The
+  intended strategy wiring is `DeclarativeValidationConfig` returning
+  `{Options: s.Scheme.DropOptions(obj, oldObj)}` — the standard wiring for a
+  strategy with generated drops — which makes the generated forbidden-when-disabled
+  validator **allow** an in-use disabled field that survived dropping (so the
+  `+k8s:featureGate` forbidden check is defense-in-depth). No shipped strategy
+  wires this yet; it lands with the first real-resource migration (§6 future
+  work). Both halves consume the same `inUse_*` helpers, so they stay consistent
+  by construction. Value-keyed options (HPA `*MinReplicas==0`) cannot be fed by a
+  presence helper and stay hand-built.
 
-### 4.6 Escape hatch (opt-out levels)
+### 4.6 Escape hatch (what actually exists)
 
-1. **DV-only (default)**: omit `(drop)`.
-2. **Custom in-use**: `(drop, inUse: "custom")` — generator emits the drop body,
-   calls a hand-written `inUse_<Gate>_<Type>(old)`; codegen verifies the symbol.
-3. **Custom/omitted drop**: keep the hand-written drop entirely (value-conditioned,
-   default-reset, compound precondition, parent-collapse, list-removal, set
-   compaction, Pod container-nested).
-4. **Auto-forced**: non-addressable targets, both-Spec-and-Status types, and
-   manual-conversion types are forced to the hatch with a codegen error.
+1. **DV-only (default)**: omit `(drop: true)`.
+2. **Fully hand-written drop**: don't tag the field for dropping; keep the
+   bespoke drop (value-conditioned, default-reset, compound precondition,
+   parent-collapse, list-removal, set-compaction, Pod container-nested). There is
+   no generated custom-in-use hook.
+3. **Codegen-forced**: unsupported leaf/recursion shapes (value-typed struct
+   leaves, map-of-struct recursion) fail codegen loudly (`klog.Fatalf`), forcing
+   the field to a hand-written drop.
 
-Every `+k8s:featureGate` field is then in exactly one discoverable state:
-generated, partial-bespoke (intentional), DV-only (intentional keep), or
-listed in the approver-owned exemption file.
+> Not implemented (proposed in earlier drafts, listed here as future work): a
+> `(drop, inUse: "custom")` custom-in-use level; an approver-owned exemption
+> file; force-failing both-spec-and-status or manual-conversion types
+> (spec/status is partitioned, not rejected; there is no internal conversion
+> bridge to fail on).
 
 ### 4.7 Ordering
 
-Drop precedes validation. **Order is by data dependency, declared per resource**
-— not a global "bespoke-first" or lexical sort (counterexample:
-`dropDeallocatedStatusDevices` must run **last**). The generator emits
-ancestor-before-descendant and **refuses to co-generate** two drops where one's
-clear target is an ancestor of the other's iteration root (forces escape-hatch).
-Coexistence is verified by the whole-`Prepare*` differential (below).
+The real, delivered ordering guarantee is **write-path ordering**:
+`DropDeclaratively` runs after `Prepare*` and before all validation
+(`create.go:133` / `update.go:139`). Within a root entry, each gate's drop is
+emitted independently (a sequence of per-gate `if !enabled && !inUse { ... }`).
+
+There is **no** implemented data-dependency ordering analysis and **no**
+ancestor/descendant co-generation refusal. Drops whose order matters relative to
+each other or to bespoke drops (e.g. the `dropDeallocatedStatusDevices`
+"must-run-last" case) are a **known limitation / future work**, not a delivered
+guard — such a resource stays on a hand-written drop for now.
 
 ## 5. Testing & enforcement
 
-1. **Generated unit tests** per `(drop)` field (extend validation-gen's fixture
-   mechanism → `zz_generated.drops_test.go`): create-drops-when-off,
-   create-keeps-when-on, update-drops-when-off-not-in-use,
-   update-keeps-when-off-in-use, update-keeps-when-on.
-2. **Behavioral equivalence (the migration gate)**: a differential fuzz test
-   (apitesting fuzzer) runs the **whole strategy `Prepare*` pipeline** old vs
-   new (generated + bespoke composed) over every gate combo, asserting identical
-   output. *Not* byte-for-byte of the isolated fn — generated structure differs
-   even when behavior matches, and wrapping the whole pipeline is what covers
-   ordering interactions. Any divergence reclassifies the field to escape-hatch.
-3. **Blackbox cross-cutting** `TestFeatureGateFieldDropping`, modeled on the
-   existing `TestFieldsWipingConsistency`
-   (`test/integration/apiserver/apidefinitions/`, PR #137689) with
-   `sets.New(...)` allowlists and "DO NOT ADD NEW ENTRIES". Includes a
-   DV-vs-drop consistency assertion for declarative+`op.HasOption` resources.
-4. **Enforcement, scoped honestly**: implement the closed-world, verifiable-today
-   lint invariant *"any field carrying a gate-conditioned validator OR a drop
-   MUST also carry `+k8s:featureGate`."* The aspirational *"every new field needs
-   a gate"* is an **OWNERS/api-approver review policy**, not a mechanical gate —
-   there is no per-field introduced-version metadata (only type-level
-   `+k8s:prerelease-lifecycle-gen:introduced`), and a git-diff detector is
-   advisory at best.
-5. **Exemption list**: one approver-owned file enumerating intentionally
-   non-conforming `(resource.version)` entries (legacy no-gate, fully-bespoke,
-   manual-conversion); new entries need api-approver sign-off.
+Coverage is split across three layers (there is no single end-to-end
+real-apiserver fixture; that was prototyped and then removed in favor of the
+unit-level coverage below):
 
-## 6. Phased implementation
+**Shipped:**
 
-- **PR -1 (spike, gating)**: prove validation-gen can load `pkg/features` and
-  resolve `features.X`; hand-write the per-type delegating drop + multi-leaf
-  in-use for `DRADeviceTaints` and **behaviorally diff** it against
-  `pkg/api/resourceclaimspec/util.go` across the full create/update/in-use/gate
-  matrix. Re-estimate coverage from the result. If feature-loading or the
-  per-type model fails, revise before any other PR.
-- **PR 0 (prereq)**: land `+k8s:featureGate` DV tag to mainline; extend
-  `Conditions` to multi-gate ANDing; add `(drop)`/`(inUse:"custom")` parsing;
-  freeze the `childNode` contract; decide ScopeField-only / non-pointer-struct
-  scoping (value-structs out of Phase 1).
-- **PR 1**: carry gate+drop annotations on `childNode`; expose discoverer
-  `dropSpecsByField`. No emission.
-- **PR 2**: `genDrops` + per-type delegating emitter + root in-use hoist +
-  multi-leaf aggregation + `DropEachSliceVal`/`DropEachMapVal` + namers +
-  `--drops-output-file`; **mechanical presence-leaf single-gate only**; gate
-  symbol load-and-assert; non-addressable rejection; versioned+internal bodies;
-  generated fixture tests.
-- **PR 3**: multi-gate ANDing; nested-leaf traversal across shared sub-types
-  (the DRA two-leaf case); wire `update-codegen.sh`; auto-1:1-conversion guard.
-- **PR 4**: status-scope partitioning + assigns-only-under-Status invariant;
-  refuse both-Spec-and-Status; split vs unified call-site docs.
-- **PR 5**: escape-hatch attributes + hand-written-helper existence check;
-  data-dependency ordering + ancestor/descendant co-generation refusal.
-- **PR 6**: whole-`Prepare*` differential harness; migrate PVC
-  `VolumeAttributesClassName` (dataSourceRef stays bespoke).
-- **PR 7+**: per-resource takeover loop (PV, deviceclass, nested DRA leaves):
-  tag → prove equivalence → switch call site → delete hand-written after a
-  release.
-- **PR N (parallel)**: blackbox test + exemption file.
-- **PR N+1 (parallel)**: closed-world lint invariant.
-- **PR N+2 (deferred)**: Phase 2 auto-wiring via `registry.NewREST` /
-  `strategy.Config[T]` / `SpecAccessor` `DropDisabledFields` hook (blocked on
-  that framework, which doesn't exist yet).
+- **Generator** — `output_tests/drops/drops_test.go` calls the generated
+  functions directly, covering direct pointer drop, value-leaf clearing,
+  multi-leaf in-use preservation (OR-reduced across two sub-types), the options
+  builder (ratcheting), and status-scope isolation, across the create/update ×
+  in-use × gate matrix. Gates are toggled on the in-package fake facility (§4.4).
+  (`testscheme` *stores* but does not *invoke* drop funcs, so these tests call
+  `DropDisabledFields_*` directly.)
+- **Scheme dispatch** — `apimachinery/.../scheme_test.go` `TestSchemeDrop`:
+  `AddDropFunc`/`AddDropOptionsFunc` registration, `HasDropFunc` before/after,
+  `Drop` runs + reports it ran (and reports *not* run for an unregistered type),
+  `DropOptions`.
+- **Write-path plumbing** — `apiserver/.../rest/validate_test.go`
+  `TestDropDeclaratively`: the convert → drop → write-back round-trip with a stub
+  drop func (asserts the dropped result lands on the internal object), plus the
+  `HasDropFunc` no-op pre-check path.
+- `make update`/`make verify` reproduce all generated files (the `hasDrops` guard
+  keeps the diff to packages that actually have drops).
 
-## 6a. PR -1 spike results (done)
+**Future work (not implemented):**
 
-The gating spike was implemented and run in `kubernetes/kubernetes`
-(`pkg/api/resourceclaimspec/`, throwaway `*_spike_test.go`):
+1. Per-`(drop)` **generated** unit tests (`zz_generated.drops_test.go`).
+2. **Whole-`Prepare*` differential** fuzz harness (the migration gate): run the
+   composed old-vs-new strategy pipeline over every gate combo and assert
+   identical output; any divergence reclassifies the field to the escape hatch.
+   This is the gate that would let a hand-written drop be deleted, and it is the
+   prerequisite for the convert-back fidelity assertion (§4.3).
+3. Blackbox cross-cutting `TestFeatureGateFieldDropping` (modeled on
+   `TestFieldsWipingConsistency`) with allowlists and a DV-vs-drop consistency
+   assertion.
+4. Closed-world **lint invariant**: "any field carrying a gate-conditioned
+   validator OR a drop MUST also carry `+k8s:featureGate`."
+5. Approver-owned **exemption list** of intentionally non-conforming
+   `(resource.version)` entries.
 
-- **Per-type delegating model is behaviorally equivalent.** Hand-wrote the
-  would-be-generated per-type `dropDisabled_*` + root-hoisted, multi-leaf
-  OR-reduced `inUse_*` for `DRADeviceTaints` (internal-typed), and diffed it
-  against the real `dropDisabledDRADeviceTaintsFields` over a crafted + 500-spec
-  fuzz corpus × {create, old-empty, old-in-use, old-equals-new} × {gate on,
-  off}. **Output identical in every cell**; 903 comparisons exercised a
-  non-trivial drop (non-vacuity guard). The two-leaf aggregation
-  (`Exactly.Tolerations` + every `FirstAvailable[*].Tolerations`) is reproduced
-  by the per-type walk. The PrioritizedList→DeviceTaints ordering dependency is
-  pinned by a dedicated test.
-- **validation-gen can resolve gate constants without a Go import.** Drove
-  gengo's parser on the path string `k8s.io/kubernetes/pkg/features`: 171
-  constants parsed, `DRADeviceTaints`/`DRAPrioritizedList`/`DRAAdminAccess`
-  resolved; a typo does not (via the raw `Constants` map — note `Package.Constant()`
-  is get-or-create and unsafe for existence checks). This confirms the generator
-  in the published `k8s.io/code-generator` module can validate gate names and
-  emit `features.<Gate>` with no layering violation (gengo parses by path, not
-  Go import).
+## 6. Implementation status — the landed stack
 
-Both assumptions the architecture rests on hold. Mechanical-coverage
-re-estimation (the spike's third goal) stands: the realistic first wave is
-presence-pointer + nested-presence DRA leaves; value-conditioned/compound/Pod
-cases remain escape-hatch.
+Branch `kep5975-featuregate-tag` (base `808a553dc88`), five bisectable,
+codegen-reproducible commits:
 
-## 6b. PR 0 status (done, on branch `kep5975-featuregate-tag`)
+- **C1 `21d9812f096` — `+k8s:featureGate` tag.** The validation tag +
+  multi-valued `Conditions` (`OptionsEnabled`/`OptionsDisabled []string` +
+  `Inverted`), `Validations.DefaultConditions` (AND-merged in `Add`, resolved in
+  `registry.ExtractValidations`), `Validations.DropSpec{Gates []string}`, the
+  single `featureGateTagValidator` (ScopeField; non-pointer-struct rejected;
+  forbidden-when-disabled emitted via a deferred aggregation), and the validation
+  output-test fixture (`output_tests/tags/featuregate`, validation-gating only —
+  no `drop: true`).
+- **C2 `c6d3badc1a2` — `runtime.Scheme` drop registration + dispatch**
+  (`AddDropFunc`/`AddDropOptionsFunc`/`Drop`/`HasDropFunc`/`DropOptions`) +
+  `TestSchemeDrop`.
+- **C3 `d7bdca250ac` — `genDrops` generator.** Reuses the discovery graph; emits
+  the per-`(gate, type)` workers + root entries + options builder + `RegisterDrops`;
+  `--drops-output-file` / `--features-package` flags; the per-package
+  `+k8s:validation-gen-feature-gates` override; `hasDrops` empty-file guard;
+  supported-shape matrix with loud failures; `update-codegen.sh` wiring.
+- **C4 `a6f74786790` — apiserver write-path integration.**
+  `DeclarativeMutationStrategy` + `DropDeclaratively` (convert → drop →
+  write-back, behind the `HasDropFunc` pre-check); hooks in
+  `BeforeCreate`/`BeforeUpdate`; `TestDropDeclaratively`.
+- **C5 `758dcc9a8fc` — `output_tests/drops` fixture.** The genDrops generator
+  fixture (testscheme + in-package fake gate facility via the
+  `+k8s:validation-gen-feature-gates` override): multi-leaf same-gate across
+  sub-types, pointer leaf, value leaf, spec/status partition.
 
-The `+k8s:featureGate` **validation** tag is landed on current mainline. Note a
-material finding: the POC (`origin/default-option-poc`, base Mar 2026) is built
-on a validation-gen architecture that mainline has since **refactored** — the
-second-pass `RegisterFieldValidator`/`FieldValidator` mechanism the POC relied
-on was removed in favor of a `Deferred`/shared-map idiom (see `update.go`). So
-this was an *adaptation*, not a cherry-pick:
-
-- `Conditions` made multi-valued: `OptionsEnabled []string` / `OptionsDisabled
-  []string` / `Inverted bool` (was single-valued); `emitCondition` helper emits
-  `op.HasOption("A") && op.HasOption("B")`, optionally negated. `Conditions` had
-  **no producer** on mainline, so this was low-risk dormant infra.
-- `Validations.DefaultConditions *Conditions` added; merged (AND) in `Add`;
-  resolved onto sibling functions in `registry.ExtractValidations`. This is how
-  the gate gates the field's *other* validations.
-- `validators/featuregate.go`: a single `TagValidator` (ScopeField) that records
-  gates per field path, returns `DefaultConditions` for sibling gating, and emits
-  the aggregated forbidden+optional pair via a `Deferred` callback (so a
-  multi-gated field yields one `!(A && B)` check, matching the POC's intent).
-- Output test `output_tests/tags/featuregate/` (ported from POC, behavior-based):
-  all pass — single/multi gate, pointer/slice/map/value/struct-ptr, create +
-  update ratcheting. Full validation-gen suite green; gofmt/build clean; tag
-  shows in `--docs`.
-
-**Deliberate deviation from the §6 plan:** PR 0 here is the **validation tag
-only**. The `(drop)` / `(inUse:"custom")` attribute parsing and the
-`childNode` drop-spec contract are *not* included — they are inert without the
-drop emitter and would freeze tag syntax prematurely. They move to the
-drop-emitter PRs (was §6 PR 1/PR 2). This keeps PR 0 a clean, independently
-useful, reviewable DV change owned by the declarative-validation effort.
-
-## 6c. PR 1 status (done, on branch `kep5975-featuregate-tag`)
-
-Drop opt-in parsing + per-field drop-spec plumbing landed (no emission):
-
-- `+k8s:featureGate(drop:true)=<Gate>` — a `drop` named-bool arg opts a field
-  into automatic dropping. A bare `+k8s:featureGate=<Gate>` is DV-only and is
-  never dropped (the HPA-safe default). Codetags arg syntax is no-space:
-  `(drop:true)`, gate as the value.
-- `featureGateTagValidator` now records a per-field `featureGateFieldSpec{gates
-  []string, drop bool}` (the "drop spec" the emitter will consume), replacing the
-  previous gate-name-only map.
-- The `drop` arg is declared in `Docs()` (type bool) so the registry accepts it.
-- Output test `DropStruct` (single + multi gate, one carrying `drop:true`) plus
-  `TestDropStruct` confirm the drop arg is accepted and **declarative-validation
-  behavior is identical** to a gated field without it. Full validation-gen suite
-  green (147 pkgs), module builds, gofmt clean.
-
-## 6d. PR 2 status (done — emitter built & verified end-to-end)
-
-The `genDrops` generator is implemented in validation-gen and proven end-to-end
-on a self-contained internal-typed fixture:
-
-- New `--drops-output-file` flag (+ `--features-package`, default
-  `k8s.io/kubernetes/pkg/features`) adds `genDrops` alongside `genValidations`;
-  inactive without the flag (full validation-gen suite stays green, 147 pkgs).
-- `genDrops` emits the **per-type, per-gate** model the spike validated:
-  `dropDisabled_<Gate>_<Type>` (clears + recurses), `inUse_<Gate>_<Type>`
-  (OR-reduces), and the entry `dropDisabledFields_<Root>(newObj, oldObj)` that
-  drops each gate when `!DefaultFeatureGate.Enabled(features.<Gate>) &&
-  !inUse_<Gate>_<Root>(oldObj)`. Per-(gate,type) functions are cycle-safe by
-  construction; gate constants are referenced via `features.<Gate>` resolved
-  through the gengo universe (spike Part B).
-- Supported mechanical cases: pointer/slice/map drop leaves; recursion through
-  structs, pointers-to-structs, and slices-of-(structs|pointers). Unsupported
-  cases (value-typed leaves, map-of-struct recursion) **fail codegen loudly**,
-  never silently skipped.
-- Fixture `pkg/api/fielddroptest/` (Root→Spec→Requests[]→{Tolerations,
-  Exactly→Tolerations}) exercises a direct pointer leaf (one gate) and a
-  **multi-leaf** gate spanning two sub-types. Generated code compiles in the
-  main module; behavior tests pass the full create/update × in-use × gate matrix,
-  including multi-leaf in-use preservation.
-
-Follow-ups since landed:
-
-- **Value-typed drop leaves** — gated non-pointer scalars (string/bool/numeric)
-  clear to their zero value (`""`/`false`/`0`), in-use via `!= zero`. Fixture
-  `Mode string` leaf + test.
-- **Spec/status partitioning** — root types emit two entries,
-  `dropDisabledFields_<Root>` (spec) and `dropDisabledStatusFields_<Root>`
-  (fields reached through the `Status` member), mirroring the hand-written
-  `DropDisabledFields` / `DropDisabledFieldsFromStatus` split. Per-gate root
-  helpers are member-scoped; shared sub-type helpers are reused across scopes.
-  Fixture `Status` field + scope-isolation tests.
-
-Remaining for the emitter: map-of-struct recursion (currently fails loudly);
-package-qualified function names for cross-package sub-types; and the real-API
-wiring (the versioned/internal bridge, design §7 Q1) — the fixture sidesteps the
-bridge by being internal-typed and self-contained.
+Future work: real-resource migration (with the §5.2 differential + §4.3 fidelity
+test) — which also lands the first strategy that wires `Scheme.DropOptions` into
+`DeclarativeValidationConfig` (§4.5); the remaining §5 enforcement items; the
+§4.7 ordering analysis; map-of-struct recursion.
 
 ## 7. Decisions and open questions
 
-### Resolved (2026-06-15)
+### Resolved
 
-1. **Emission target — versioned-only, drop pre-conversion.** Drops are emitted
-   versioned-typed and applied to the *versioned* object early in the write
-   pipeline (decode → default → **drop** → convert to internal → store), NOT in
-   the internal strategy. This removes the versioned/internal bridge and
-   dual-body generation entirely (genDrops emits a single body for the type it
-   runs on). Cost: a new pipeline integration point, and the proposed
-   `strategy.Config.DropDisabledFields` hook no longer fits — dropping moves out
-   of the strategy. **Implication:** since validation runs after the drop, the
-   forbidden-on-disabled check becomes redundant for dropped fields; ratcheting
-   (allow an in-use disabled field) is preserved by the generated Options builder
-   (below). The pipeline hook (where new-versioned and a convertible old meet
-   before internal conversion) is the next design/impl task — see §8.
-2. **Generate the DV Options builder** from the shared in-use helper, mechanically
-   closing the drop-vs-validation desync loop for declarative + `op.HasOption`
-   resources. Value-keyed gates (e.g. HPA `MinReplicas==0`) stay hand-built.
-3. **First migration target — resourceclaimspec / DRADeviceTaints**, matching the
-   spike and fixture; proven via a whole-pipeline differential vs the existing
-   `dropDisabledDRADeviceTaintsFields`.
+1. **Emission target — versioned, registered on `runtime.Scheme`, run via a
+   write-path hook.** (This reverses the interim "internal-typed, in strategy"
+   decision — see §8.) `genDrops` emits versioned drops into
+   `pkg/apis/<grp>/<ver>/zz_generated.drops.go`; execution is
+   `DeclarativeMutationStrategy.DropDeclaratively` in `rest.BeforeCreate`/
+   `BeforeUpdate`, which converts internal→versioned, runs `Scheme.Drop`, and
+   converts back. There **is** a runtime versioned/internal bridge and there
+   **is** a new write-path hook; there is **no** generator-side dual-body
+   emission and **no** input-redirect/helper package.
+2. **Generate the DV Options builder** from the shared in-use helper —
+   *implemented*: `DeclarativeValidationOptions_<Root>` → `Scheme.DropOptions`.
+   The strategy-side wiring (`DeclarativeValidationConfig` returning those
+   options) lands with the first real-resource migration (§4.5). Value-keyed
+   gates stay hand-built.
+3. **No shipped resource migrated.** (This reverses the interim
+   "resourceclaimspec / DRADeviceTaints first" decision.) The proof is the
+   `output_tests/drops` generator fixture plus the scheme/write-path unit tests
+   (§5); the prototyped self-contained end-to-end example was removed once those
+   unit tests covered the dispatch and round-trip. `resourceclaimspec` remains
+   the untouched hand-written drop.
+4. **Scope restrictions** — ScopeField-only and non-pointer-struct rejection are
+   the shipped behavior. **Multi-gate** "drop if any required gate disabled &
+   not-in-use" is implemented (AND-merged `DefaultConditions` + forbidden
+   `Inverted` over all gates; `DropSpec` accumulates gates) — though still
+   unproven against a real hand-written precedent.
 
 ### Still open
 
-- Keep the POC's ScopeField-only + non-pointer-struct restrictions for Phase 1?
-- **Multi-gate drop semantics**: no hand-written precedent to diff against —
-  confirm "drop if any required gate disabled & not-in-use" or defer until a real
-  case appears.
-- Exemption-file ownership/location; is the "new field needs a gate" policy
-  OWNERS-review-only, or worth a per-field introduced-version mechanism
+- **Convert-back fidelity**: confirm the whole-pipeline differential + a
+  per-resource round-trip fidelity test are sufficient to safely write back a
+  versioned-converted object on update, or whether a field-scoped write-back is
+  needed for resources with lossy/manual conversions (§4.3).
+- **Real-resource migration** + equivalence differential vs the existing
+  hand-written drop (the §6 "future work").
+- **Ordering**: do any first-wave targets need the data-dependency / must-run-last
+  analysis, or can they stay hand-written until one appears (§4.7)?
+- **Enforcement surface**: exemption-file ownership/location; is "new field needs
+  a gate" OWNERS-review-only, or worth a per-field introduced-version mechanism
   (separate KEP)?
-- Soak: is whole-pipeline fuzz equivalence enough to delete a hand-written drop,
-  or require a release-cycle CI soak first?
+- **Generalize to a mutation pass?** (Under consideration.) The runtime seam is
+  already mutation-shaped — the interface is `DeclarativeMutationStrategy`, not
+  drop-specific, and `DropDeclaratively` already converts **both** new and old
+  and writes back, so reading `old` (needed for ratcheting) generalizes for free.
+  Plausible additional tenants of one strategy-time pass: **field wiping** (same
+  shape as dropping) and **reset-to-old** (immutable-per-subresource fields —
+  viable on the existing convert-new+old→write-back rails; the open part is the
+  *tag modeling*, not the execution). **Defaulting stays separate**: it runs at
+  decode on the versioned object across many code paths (etcd reads, list, watch,
+  conversion) and is already generated by defaulter-gen; the mutation pass runs
+  *after* defaults on the internal object. If pursued, this is a file/registration
+  rename (`zz_generated.drops.go` → `zz_generated.mutations.go`, `RegisterDrops`
+  → an umbrella `RegisterMutations`) plus possibly generalizing `Scheme.Drop` to
+  `Scheme.Mutate` — keeping the drop-specific `DropOptions` (validation
+  ratcheting) separate, since it is not a mutation.
 
-## 8. Pre-conversion drop pipeline integration (next task)
+## 8. Design history (two reversals)
 
-The versioned-only decision requires a hook that runs the generated
-`dropDisabledFields_<VersionedType>(newObj, oldObj)` on the decoded+defaulted
-versioned object before it is converted to the internal type. The open
-sub-problems: (a) the exact hook location in the create/update handlers where the
-new versioned object is available; (b) supplying the old object in versioned form
-for in-use/ratcheting on update (old is fetched from storage as the storage
-version); (c) per-resource opt-in/registration of the generated drop function;
-(d) interaction with defaulting (drop must run after defaults) and with the
-storage-version codec. This is investigated in the implementation notes before
-wiring resourceclaimspec.
+The emission/execution model reversed twice before landing on Model C2; recorded
+here so the reversals aren't re-litigated.
+
+1. **Versioned (pre-conversion) — first attempt.** Run the generated drop on the
+   decoded+defaulted versioned object before it is converted to internal.
+   Abandoned after finding the write handlers expose no pre-conversion versioned
+   object (decode fuses decode+default+convert-to-hub).
+2. **Internal-typed, in strategy — interim.** Emit internal-typed drops (a
+   "drops-only" generation mode + a helper-package input-redirect) run in
+   `PrepareForCreate`/`PrepareForUpdate`, and migrate `resourceclaimspec`.
+   Abandoned because it duplicated generation machinery and split the tag away
+   from the versioned types where declarative validation reads it. **None of this
+   shipped**: there is no `--drops-only` flag, no `+k8s:validation-gen-drops`
+   activation, no input-redirect, and `resourceclaimspec` is untouched.
+3. **Model C2 — versioned via explicit in-write-path conversion (shipped).**
+   Keep the tag and emission on the versioned types, but instead of relying on a
+   pre-conversion object, **explicitly** convert internal→versioned inside the
+   write path (`DropDeclaratively`), drop, and convert back. This answers the
+   original open sub-problems: (a) hook location = `BeforeCreate`/`BeforeUpdate`
+   after `Prepare*`, before validation; (b) old in versioned form =
+   `ConvertToVersion(oldObj)` on update only; (c) per-resource opt-in =
+   `RegisterDrops` + embedding `rest.DeclarativeValidation` + the `HasDropFunc`
+   pre-check; (d) defaulting interaction = drop runs post-default on a freshly
+   converted copy, then converts back.
+
+Two architectural assumptions validated by the original spike carried through
+all three models and remain load-bearing: the **per-type delegating** drop model
+is behaviorally equivalent to hand-written drops (incl. multi-leaf OR-reduced
+in-use), and **validation-gen can resolve gate constants by package path**
+through the gengo universe without a Go import (no layering violation).
