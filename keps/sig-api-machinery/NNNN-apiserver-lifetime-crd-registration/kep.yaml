@@ -1,0 +1,64 @@
+title: Static CustomResourceDefinitions
+kep-number: NNNN
+authors:
+  - "@jpbetz"
+owning-sig: sig-api-machinery
+participating-sigs:
+  - sig-etcd
+  - sig-scalability
+status: provisional
+creation-date: 2026-08-24
+reviewers:
+  - "@sttts"
+  - "@serathius"
+  - "@wojtek-t"
+  - "@enj"
+  - "@jefftree"
+approvers:
+  - "@liggitt"
+  - "@deads2k"
+
+see-also:
+  - "/keps/sig-api-machinery/5793-manifest-based-admission-control-config"
+  - "/keps/sig-api-machinery/4192-svm-in-tree"
+  - "/keps/sig-api-machinery/4020-unknown-version-interoperability-proxy"
+  - "/keps/sig-api-machinery/2337-k8s.io-group-protection"
+
+stage: alpha
+
+latest-milestone: "v1.39"
+
+milestone:
+  alpha: "v1.39"
+  beta: "v1.41"
+  stable:
+
+feature-gates:
+  - name: StaticCustomResourceDefinitions
+    components:
+      - kube-apiserver
+  - name: CustomResourceStorageOverrides
+    components:
+      - kube-apiserver
+disable-supported: true
+
+metrics:
+  # Registration / manifest loading health (KEP-5793 naming convention)
+  - apiserver_static_crd_controller_automatic_reloads_total
+  - apiserver_static_crd_controller_automatic_reload_last_timestamp_seconds
+  - apiserver_static_crd_controller_last_config_info
+  - apiserver_static_crd_controller_last_storage_config_info
+  - apiserver_static_crd_controller_reconcile_total
+  - apiserver_static_crd_controller_last_reconcile_success_timestamp_seconds
+  - apiserver_static_crd_registered
+  - apiserver_static_crd_unsynced
+  # Revision convergence (manifest lifecycle arbitration)
+  - apiserver_static_crd_controller_manifest_revision
+  - apiserver_static_crd_controller_config_behind
+  - apiserver_static_crd_controller_frozen
+  - apiserver_static_crd_denied_writes_total
+  # Storage binding safety and observability
+  - apiserver_custom_resource_storage_binding
+  - apiserver_custom_resource_storage_precheck_total
+  - apiserver_custom_resource_storage_binding_rejected_total
+  - apiserver_static_crd_storage_warmup_duration_seconds
